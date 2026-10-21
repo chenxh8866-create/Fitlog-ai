@@ -1,0 +1,5 @@
+.env
+.env.*
+.vercel
+node_modules
+index - 副本.txt
