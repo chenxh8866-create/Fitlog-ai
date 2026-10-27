@@ -279,12 +279,22 @@
         <button id="tab-ai" class="tab active">AI 帮我选部位</button>
         <button id="tab-self" class="tab">自己选部位</button>
       </div>
+      <div class="plan-row">
+        <label class="field-label">场景</label>
+        <select id="plan-place">
+          <option value="商业健身房（器械齐全）">商业健身房（器械齐全）</option>
+          <option value="家庭（少量器械）">家庭（少量器械）</option>
+          <option value="无器械 / 户外">无器械 / 户外</option>
+        </select>
+      </div>
+      <div class="plan-tip">商业健身房：主训练优先使用器械，热身与拉伸采用徒手动作。</div>
       <div id="part-picker" class="plan-row" style="display:none">
         <label class="field-label">部位</label>
         <select id="plan-part">
           <option>胸</option>
           <option>背</option>
           <option>腿</option>
+          <option>臀</option>
           <option>肩</option>
           <option>手臂</option>
           <option>核心</option>
@@ -350,12 +360,13 @@
 - "训练构成"里有氧 + 无氧的时长加起来要尽量等于"时长_分钟"；用户只提到一个类型时另一个填 0。
 - 拉伸建议只针对今天练的部位，以及明显不适的部位。`;
 
-    const PLAN_PROMPT = `你是一个健身教练。用户会告诉你今天有多少时间，以及想练哪个部位（有时没指定）。
+    const PLAN_PROMPT = `你是一个健身教练。用户会告诉你训练场景、今天有多少时间，以及想练哪个部位（有时没指定）。
 请生成一份当天的训练计划，只输出 JSON，不要任何解释：
 {
+  "场景": "...",
   "热身": "...",
   "动作": [
-    { "动作名": "...", "组数": 数字, "次数": "...", "要领": "..." }
+    { "动作名": "...", "器械": "...", "组数": 数字, "次数": "...", "要领": "..." }
   ],
   "提示": "..."
 }
@@ -363,6 +374,11 @@
 - 如果用户没指定部位，你先根据新手情况和时长推荐一个部位，再围绕它生成计划。
 - 动作按训练顺序排列，数量和总时长匹配（约 1 小时 4-6 个动作）。
 - 只针对确定的部位，别塞无关部位。
+- 先识别训练场景，再决定动作类型：用户选择“商业健身房（器械齐全）”时，主训练动作必须优先使用常见健身房器械或自由重量，包括杠铃、哑铃、史密斯机、龙门架/绳索、坐姿划船机、高位下拉机、胸推机、腿举机、腿屈伸/腿弯举机、臀推机、髋外展机、跑步机、单车或椭圆机等。
+- 商业健身房场景下，热身和拉伸可以使用徒手动作；但“动作”数组中的主训练不能全部使用俯卧撑、徒手深蹲、徒手臀桥、平板支撑等无器械动作，除非用户明确要求无器械或说明器械不可用。
+- 如果某个器械可能不是每家门店都有，优先选择更常见的器械，并在“提示”里给出一个器械替代方案；不要假设所有门店设备完全一致。
+- 针对“臀”，优先考虑杠铃/史密斯臀推、臀推机、绳索后踢、髋外展机、腿举机等；不要只给徒手臀桥。
+- “器械”字段必须写明动作使用的器械；热身或拉伸写“徒手/活动度”。
 - "要领"写新手最容易做错的一个点，一句话即可。`;
 
     const btn = document.getElementById("go");
@@ -501,6 +517,7 @@
     const tabSelf = document.getElementById("tab-self");
     const partPicker = document.getElementById("part-picker");
     const planPart = document.getElementById("plan-part");
+    const planPlace = document.getElementById("plan-place");
     const planTime = document.getElementById("plan-time");
     const planGo = document.getElementById("plan-go");
     const planStatus = document.getElementById("plan-status");
@@ -526,9 +543,9 @@
 
       let text;
       if (planMode === "ai") {
-        text = "今天时长 " + time + " 分钟，请你根据新手情况帮我选一个部位。";
+        text = "训练场景：" + planPlace.value + "。今天时长 " + time + " 分钟，请你根据新手情况帮我选一个部位。";
       } else {
-        text = "今天练" + planPart.value + "，时长 " + time + " 分钟。";
+        text = "训练场景：" + planPlace.value + "。今天练" + planPart.value + "，时长 " + time + " 分钟。";
       }
 
       planGo.disabled = true;
@@ -536,7 +553,13 @@
       planCard.classList.remove("show");
 
       try {
-        const p = await askAI(PLAN_PROMPT, text);
+        let p = await askAI(PLAN_PROMPT, text);
+        // Badcase guard: if a gym plan comes back mostly bodyweight-only,
+        // ask the model once more with the violated constraint made explicit.
+        if (needsEquipmentRetry(p, planPlace.value)) {
+          planStatus.textContent = "正在校正器械训练动作…";
+          p = await askAI(PLAN_PROMPT, text + " 上一次计划没有满足商业健身房器械约束，请重新生成：主训练动作至少 60% 使用常见器械或自由重量，并为每个动作填写器械字段；徒手动作只放在热身或拉伸。 ");
+        }
         renderPlan(p);
         planStatus.textContent = "✅ 计划已生成";
       } catch (e) {
@@ -546,12 +569,24 @@
       }
     }
 
+    function needsEquipmentRetry(plan, place) {
+      if (!place.includes("商业健身房")) return false;
+      const moves = Array.isArray(plan && plan.动作) ? plan.动作 : [];
+      if (moves.length === 0) return true;
+      const equipmentMoves = moves.filter(m => {
+        const tool = String(m.器械 || "");
+        return tool && !/(徒手|无器械|活动度)/.test(tool);
+      });
+      return equipmentMoves.length < Math.max(2, Math.ceil(moves.length * 0.6));
+    }
+
     function renderPlan(p) {
       const moves = (p.动作 || []).map((m, i) =>
-        `<div class="row"><span class="k">${i + 1}. ${m.动作名}</span><span>${m.组数} 组 × ${m.次数}</span></div>
+        `<div class="row"><span class="k">${i + 1}. ${m.动作名}${m.器械 ? ` <small style="color:var(--accent)">· ${m.器械}</small>` : ""}</span><span>${m.组数} 组 × ${m.次数}</span></div>
          ${m.要领 ? `<div class="plan-tip">· ${m.要领}</div>` : ""}`).join("");
       planCard.innerHTML = `
         <h2>今日训练计划</h2>
+        ${p.场景 ? `<div class="row"><span class="k">训练场景</span><span>${p.场景}</span></div>` : ""}
         <div class="row"><span class="k">热身</span><span>${p.热身}</span></div>
         <div class="sec"><h3>动作</h3>${moves}</div>
         ${p.提示 ? `<div class="remind">💡 ${p.提示}</div>` : ""}
